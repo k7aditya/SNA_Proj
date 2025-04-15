@@ -32,9 +32,9 @@ else:
     st.warning("Please upload the LAPD Calls-for-Service CSV file.")
     st.stop()
 
-# Use only 0.01% of data for memory efficiency
-df = df.sample(frac=0.0001, random_state=42).reset_index(drop=True)
-st.metric("Rows after sampling", len(df))
+# Use only 0.1% of data for memory efficiency
+df = df.sample(frac=0.001, random_state=42).reset_index(drop=True)
+
 # Parse datetime
 df['Dispatch Date'] = pd.to_datetime(df['Dispatch Date'], errors='coerce')
 df['Dispatch Time'] = pd.to_timedelta(df['Dispatch Time'], errors='coerce')
@@ -85,7 +85,7 @@ with st.spinner("Geocoding locations..."):
                 location = geolocator.geocode(location_query, timeout=10)
                 if location:
                     real_coords[row['Reporting District']] = (location.latitude, location.longitude)
-                # time.sleep(1)
+                time.sleep(1)
             except Exception:
                 pass
 
@@ -188,7 +188,7 @@ def identify_hoax_calls(gdf, hoax_call_types, time_window_minutes, distance_thre
         return 0.0
     
     # Apply pattern matching but only to a subset for efficiency
-    pattern_sample = gdf_sorted.sample(min(len(gdf_sorted), 100), random_state=42)
+    pattern_sample = gdf_sorted.sample(min(len(gdf_sorted), 10000), random_state=42)
     pattern_scores = {}
     
     for idx, row in pattern_sample.iterrows():
@@ -389,185 +389,398 @@ for _, row in gdf.iterrows():
 
 folium_static(m)
 
-# --- Graph Construction ---
+# === FILTER FOR SUSPICIOUS AND HOAX CALLS ONLY ===
+# Create a dataframe with only suspicious and hoax calls for remaining analyses
+suspicious_and_hoax = gdf_with_hoax[gdf_with_hoax['hoax_classification'].isin(['Suspicious', 'Likely Hoax'])]
+st.subheader("⚠️ Suspicious and Hoax Calls Analysis")
+st.write(f"Analyzing {len(suspicious_and_hoax)} suspicious and hoax calls (out of {len(gdf_with_hoax)} total calls)")
+
+# --- Graph Construction (SUSPICIOUS AND HOAX ONLY) ---
 threshold_km = 10
 G = nx.Graph()
 
-for idx, row in gdf.iterrows():
+for idx, row in suspicious_and_hoax.iterrows():
     G.add_node(row['Reporting District'], lat=row['Latitude'], lon=row['Longitude'])
 
-coords = np.array(list(zip(gdf['Latitude'], gdf['Longitude'])))
-tree = cKDTree(coords)
+coords_filtered = np.array(list(zip(suspicious_and_hoax['Latitude'], suspicious_and_hoax['Longitude'])))
+tree = cKDTree(coords_filtered)
 pairs = tree.query_pairs(threshold_km / 111)
 
+# Create an index mapping for the filtered data
+idx_mapping = {i: idx for i, idx in enumerate(suspicious_and_hoax.index)}
+
 for i, j in pairs:
-    d1 = gdf.iloc[i]['Reporting District']
-    d2 = gdf.iloc[j]['Reporting District']
+    d1 = suspicious_and_hoax.iloc[i]['Reporting District']
+    d2 = suspicious_and_hoax.iloc[j]['Reporting District']
     distance = geodesic(
-        (gdf.iloc[i]['Latitude'], gdf.iloc[i]['Longitude']),
-        (gdf.iloc[j]['Latitude'], gdf.iloc[j]['Longitude'])
+        (suspicious_and_hoax.iloc[i]['Latitude'], suspicious_and_hoax.iloc[i]['Longitude']),
+        (suspicious_and_hoax.iloc[j]['Latitude'], suspicious_and_hoax.iloc[j]['Longitude'])
     ).kilometers
     if distance < threshold_km:
         G.add_edge(d1, d2, weight=distance)
 
-# --- Propagation Analysis ---
-gdf_sorted = gdf.sort_values('Datetime')
-gdf_sorted['Time_diff'] = gdf_sorted['Datetime'].diff().dt.total_seconds().fillna(0)
+# --- Propagation Analysis (SUSPICIOUS AND HOAX ONLY) ---
+suspicious_and_hoax_sorted = suspicious_and_hoax.sort_values('Datetime')
+suspicious_and_hoax_sorted['Time_diff'] = suspicious_and_hoax_sorted['Datetime'].diff().dt.total_seconds().fillna(0)
 
-def detect_propagation_chains(gdf_sorted, time_threshold=120, distance_threshold_km=10):
+def detect_propagation_chains(sorted_df, time_threshold=120, distance_threshold_km=10):
     chains = []
-    current_chain = [gdf_sorted.iloc[0]]
+    if len(sorted_df) == 0:
+        return chains
+        
+    current_chain = [sorted_df.iloc[0]]
 
-    for i in range(1, len(gdf_sorted)):
-        t_diff = (gdf_sorted.iloc[i]['Datetime'] - gdf_sorted.iloc[i-1]['Datetime']).total_seconds() / 60
+    for i in range(1, len(sorted_df)):
+        t_diff = (sorted_df.iloc[i]['Datetime'] - sorted_df.iloc[i-1]['Datetime']).total_seconds() / 60
         d_diff = geodesic(
-            (gdf_sorted.iloc[i]['Latitude'], gdf_sorted.iloc[i]['Longitude']),
-            (gdf_sorted.iloc[i-1]['Latitude'], gdf_sorted.iloc[i-1]['Longitude'])
+            (sorted_df.iloc[i]['Latitude'], sorted_df.iloc[i]['Longitude']),
+            (sorted_df.iloc[i-1]['Latitude'], sorted_df.iloc[i-1]['Longitude'])
         ).kilometers
 
         if t_diff <= time_threshold and d_diff <= distance_threshold_km:
-            current_chain.append(gdf_sorted.iloc[i])
+            current_chain.append(sorted_df.iloc[i])
         else:
-            chains.append(current_chain)
-            current_chain = [gdf_sorted.iloc[i]]
+            if len(current_chain) > 1:  # Only add chains with more than one call
+                chains.append(current_chain)
+            current_chain = [sorted_df.iloc[i]]
 
-    if current_chain:
+    if len(current_chain) > 1:  # Add the final chain if it has more than one call
         chains.append(current_chain)
 
     return chains
 
-chains = detect_propagation_chains(gdf_sorted)
+chains = detect_propagation_chains(suspicious_and_hoax_sorted)
 
 st.subheader("📊 Propagation Chain Summary")
-st.markdown(f"*Detected {len(chains)} propagation chains.*")
+st.markdown(f"*Detected {len(chains)} propagation chains among suspicious and hoax calls.*")
 
-for idx, chain in enumerate(chains[:10]):
-    st.markdown(f"### Chain {idx+1}:")
-    for call in chain:
-        st.write(f"- {call['Datetime']} | District: {call['Reporting District']} | Call Type: {call['Call Type Code']}")
-
-# --- Time Analysis --- #
-st.subheader("⏱ Call Time Analysis")
-
-fig1, ax1 = plt.subplots(figsize=(10, 5))
-ax1.hist(gdf_sorted['Time_diff'] / 60, bins=50, color='skyblue', edgecolor='black')
-ax1.set_xlabel("Time Difference Between Calls (minutes)")
-ax1.set_ylabel("Frequency")
-ax1.set_title("Distribution of Time Differences Between Hoax Calls")
-ax1.grid(True)
-st.pyplot(fig1)
-
-# Dropdown for time resolution
-time_view = st.selectbox("Select Time Resolution", options=["Daily", "Hourly (Sample of 20)"])
-
-if time_view == "Daily":
-    # Calls per day
-    calls_per_day = gdf_sorted.set_index('Datetime').resample('D').size()
-    fig2, ax2 = plt.subplots(figsize=(14, 6))
-    calls_per_day.plot(ax=ax2, kind='line', marker='o', color='red')
-    ax2.set_title('Hoax Call Frequency Over Time (Daily)')
-    ax2.set_xlabel('Date')
-    ax2.set_ylabel('Number of Calls')
-    ax2.grid(True)
-    ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45)
-    st.pyplot(fig2)
-
+if len(chains) > 0:
+    for idx, chain in enumerate(chains[:10]):
+        st.markdown(f"### Chain {idx+1}:")
+        for call in chain:
+            st.write(f"- {call['Datetime']} | District: {call['Reporting District']} | Call Type: {call['Call Type Code']} | Classification: {call['hoax_classification']}")
 else:
-    # Hourly distribution from a sample
-    import matplotlib.dates as mdates
+    st.write("No propagation chains detected among suspicious and hoax calls with current parameters.")
 
-    gdf_sample = gdf_sorted.sample(n=20, random_state=42)
-    if 'Datetime' in gdf_sample.columns:
-        gdf_sample = gdf_sample.sort_values('Datetime').set_index('Datetime')
+# --- Time Analysis (SUSPICIOUS AND HOAX ONLY) --- 
+st.subheader("⏱ Call Time Analysis (Suspicious and Hoax Calls Only)")
+
+if len(suspicious_and_hoax_sorted) > 1:
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.hist(suspicious_and_hoax_sorted['Time_diff'] / 60, bins=50, color='red', edgecolor='black')
+    ax1.set_xlabel("Time Difference Between Calls (minutes)")
+    ax1.set_ylabel("Frequency")
+    ax1.set_title("Distribution of Time Differences Between Suspicious and Hoax Calls")
+    ax1.grid(True)
+    st.pyplot(fig1)
+
+    # Dropdown for time resolution
+    time_view = st.selectbox("Select Time Resolution", options=["Daily", "Hourly (Sample)"])
+
+    if time_view == "Daily":
+        # Calls per day
+        calls_per_day = suspicious_and_hoax_sorted.set_index('Datetime').resample('D').size()
+        fig2, ax2 = plt.subplots(figsize=(14, 6))
+        calls_per_day.plot(ax=ax2, kind='line', marker='o', color='red')
+        ax2.set_title('Suspicious and Hoax Call Frequency Over Time (Daily)')
+        ax2.set_xlabel('Date')
+        ax2.set_ylabel('Number of Calls')
+        ax2.grid(True)
+        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45)
+        st.pyplot(fig2)
     else:
-        gdf_sample = gdf_sample.sort_index()
+        # Hourly distribution from a sample or all if small
+        import matplotlib.dates as mdates
 
-    calls_per_hour = gdf_sample.resample('h').size()
+        sample_size = min(20, len(suspicious_and_hoax_sorted))
+        suspicious_sample = suspicious_and_hoax_sorted.sample(n=sample_size, random_state=42)
+        if 'Datetime' in suspicious_sample.columns:
+            suspicious_sample = suspicious_sample.sort_values('Datetime').set_index('Datetime')
+        else:
+            suspicious_sample = suspicious_sample.sort_index()
 
-    fig_hourly, ax_hourly = plt.subplots(figsize=(12, 6))
-    ax_hourly.plot(calls_per_hour.index, calls_per_hour.values, marker='o', linestyle='-', color='red')
-    ax_hourly.set_title("Hoax Call Frequency Over Time (Sample of 20 Calls - Hourly)")
-    ax_hourly.set_xlabel("Time")
-    ax_hourly.set_ylabel("Number of Calls")
-    ax_hourly.grid(True)
+        calls_per_hour = suspicious_sample.resample('h').size()
 
-    ax_hourly.set_facecolor("lightgray")
-    ax_hourly.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=10))
-    ax_hourly.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
-    plt.xticks(rotation=45, fontsize=8)
+        fig_hourly, ax_hourly = plt.subplots(figsize=(12, 6))
+        ax_hourly.plot(calls_per_hour.index, calls_per_hour.values, marker='o', linestyle='-', color='red')
+        ax_hourly.set_title(f"Suspicious and Hoax Call Frequency Over Time (Sample of {sample_size} Calls - Hourly)")
+        ax_hourly.set_xlabel("Time")
+        ax_hourly.set_ylabel("Number of Calls")
+        ax_hourly.grid(True)
+
+        ax_hourly.set_facecolor("lightgray")
+        ax_hourly.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=10))
+        ax_hourly.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+        plt.xticks(rotation=45, fontsize=8)
+        plt.tight_layout()
+        st.pyplot(fig_hourly)
+else:
+    st.write("Not enough suspicious and hoax calls for time series analysis.")
+
+# --- Correlation (SUSPICIOUS AND HOAX ONLY) ---
+st.subheader("📌 Cross-Region Correlation (Suspicious and Hoax Calls Only)")
+if len(suspicious_and_hoax) > 5:  # Only run if we have enough data
+    # We need at least some data in multiple districts to calculate correlation
+    district_counts = suspicious_and_hoax['Reporting District'].value_counts()
+    districts_with_multiple = district_counts[district_counts > 1].index.tolist()
+    
+    if len(districts_with_multiple) > 1:
+        pivot = pd.crosstab(
+            suspicious_and_hoax['Reporting District'], 
+            suspicious_and_hoax['Call Type Description']
+        )
+        if pivot.shape[0] > 1 and pivot.shape[1] > 0:
+            corr = pivot.T.corr()
+            fig3, ax3 = plt.subplots(figsize=(12, 8))
+            sns.heatmap(corr, cmap='Reds', ax=ax3)
+            ax3.set_title("Cross-Region Correlation Based on Call Type Patterns (Suspicious and Hoax Calls)")
+            st.pyplot(fig3)
+        else:
+            st.write("Not enough variation in data to calculate correlation matrix.")
+    else:
+        st.write("Not enough districts with multiple calls to calculate correlation.")
+else:
+    st.write("Not enough suspicious and hoax calls for correlation analysis.")
+
+# --- Graph (SUSPICIOUS AND HOAX ONLY) ---
+st.subheader("📡 Distance-Based Relationship Graph (Suspicious and Hoax Calls Only)")
+if len(G.nodes()) > 0:
+    fig4, ax4 = plt.subplots(figsize=(12, 8))
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_size=500, node_color='red', edge_color='gray', ax=ax4)
+    ax4.set_title("Distance-based Relationship Graph (Suspicious and Hoax Calls)")
+    st.pyplot(fig4)
+else:
+    st.write("Not enough connected suspicious and hoax calls to create a graph.")
+
+# --- Clustering (SUSPICIOUS AND HOAX ONLY) --- 
+if len(suspicious_and_hoax) >= 5:  # Only run clustering if we have enough data
+    suspicious_coords = suspicious_and_hoax[['Latitude', 'Longitude']].values
+    suspicious_scaled_coords = StandardScaler().fit_transform(suspicious_coords)
+    
+    # Determine appropriate number of clusters based on data size
+    n_clusters = min(3, max(2, len(suspicious_and_hoax) // 10))
+    
+    try:
+        suspicious_kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(suspicious_coords)
+        suspicious_and_hoax['Cluster_KMeans'] = suspicious_kmeans.labels_
+        
+        # DBSCAN parameters may need adjustment for sparse data
+        suspicious_dbscan = DBSCAN(eps=0.15, min_samples=min(5, len(suspicious_and_hoax) // 10)).fit(suspicious_scaled_coords)
+        suspicious_and_hoax['Cluster_DBSCAN'] = suspicious_dbscan.labels_
+        
+        suspicious_spectral = SpectralClustering(
+            n_clusters=n_clusters, 
+            assign_labels="discretize", 
+            random_state=42
+        ).fit(suspicious_scaled_coords)
+        suspicious_and_hoax['Cluster_Spectral'] = suspicious_spectral.labels_
+        
+        # --- Cluster Evaluation (SUSPICIOUS AND HOAX ONLY) --- 
+        st.subheader("📊 Clustering Evaluation (Suspicious and Hoax Calls Only)")
+        
+        # Silhouette Score
+        st.text("Silhouette Score:")
+        if len(set(suspicious_and_hoax['Cluster_KMeans'])) > 1:
+            st.text(f"KMeans: {silhouette_score(suspicious_coords, suspicious_and_hoax['Cluster_KMeans']):.3f}")
+        else:
+            st.text("KMeans: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_DBSCAN'])) > 1:
+            st.text(f"DBSCAN: {silhouette_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_DBSCAN']):.3f}")
+        else:
+            st.text("DBSCAN: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_Spectral'])) > 1:
+            st.text(f"Spectral: {silhouette_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_Spectral']):.3f}")
+        else:
+            st.text("Spectral: N/A (insufficient variation in clusters)")
+        
+        # Calinski-Harabasz Index
+        st.text("\nCalinski-Harabasz Index:")
+        if len(set(suspicious_and_hoax['Cluster_KMeans'])) > 1:
+            st.text(f"KMeans: {calinski_harabasz_score(suspicious_coords, suspicious_and_hoax['Cluster_KMeans']):.2f}")
+        else:
+            st.text("KMeans: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_DBSCAN'])) > 1:
+            st.text(f"DBSCAN: {calinski_harabasz_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_DBSCAN']):.2f}")
+        else:
+            st.text("DBSCAN: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_Spectral'])) > 1:
+            st.text(f"Spectral: {calinski_harabasz_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_Spectral']):.2f}")
+        else:
+            st.text("Spectral: N/A (insufficient variation in clusters)")
+        
+        # Davies-Bouldin Index
+        st.text("\nDavies-Bouldin Index:")
+        if len(set(suspicious_and_hoax['Cluster_KMeans'])) > 1:
+            st.text(f"KMeans: {davies_bouldin_score(suspicious_coords, suspicious_and_hoax['Cluster_KMeans']):.3f}")
+        else:
+            st.text("KMeans: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_DBSCAN'])) > 1:
+            st.text(f"DBSCAN: {davies_bouldin_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_DBSCAN']):.3f}")
+        else:
+            st.text("DBSCAN: N/A (insufficient variation in clusters)")
+            
+        if len(set(suspicious_and_hoax['Cluster_Spectral'])) > 1:
+            st.text(f"Spectral: {davies_bouldin_score(suspicious_scaled_coords, suspicious_and_hoax['Cluster_Spectral']):.3f}")
+        else:
+            st.text("Spectral: N/A (insufficient variation in clusters)")
+    except Exception as e:
+        st.error(f"Clustering error: {e}")
+        st.write("Not enough suitable data points for clustering analysis. Try adjusting parameters or using more data.")
+else:
+    st.write("Not enough suspicious and hoax calls for clustering analysis.")
+
+# --- Centrality Measures (SUSPICIOUS AND HOAX ONLY) --- 
+st.subheader("🔗 Node Centrality Measures (Suspicious and Hoax Calls Only)")
+
+if len(G.nodes()) > 0:
+    # Compute centralities
+    try:
+        betweenness = nx.betweenness_centrality(G)
+        closeness = nx.closeness_centrality(G)
+        
+        try:
+            eigenvector = nx.eigenvector_centrality(G, max_iter=1000)
+        except (nx.PowerIterationFailedConvergence, nx.NetworkXError):
+            eigenvector = {k: 0 for k in G.nodes()}
+            st.warning("Eigenvector centrality calculation did not converge. Results may not be accurate.")
+
+        centrality_options = {
+            'Betweenness Centrality': betweenness,
+            'Closeness Centrality': closeness,
+            'Eigenvector Centrality': eigenvector
+        }
+
+        selected_metric = st.selectbox(
+            "Select Centrality Metric", 
+            list(centrality_options.keys()),
+            key="suspicious_centrality_metric"
+        )
+        selected_dict = centrality_options[selected_metric]
+
+        # Top N nodes
+        sorted_centrality = sorted(selected_dict.items(), key=lambda item: item[1], reverse=True)
+        max_nodes = min(20, len(sorted_centrality))
+        top_n = st.slider("Number of top nodes to show", 5, max_nodes, min(10, max_nodes))
+
+        st.markdown(f"### Top {top_n} Reporting Districts by {selected_metric}")
+        
+        # Create a table for better visualization
+        centrality_df = pd.DataFrame(sorted_centrality[:top_n], columns=['Reporting District', 'Centrality Score'])
+        
+        # Add additional information where available
+        district_info = suspicious_and_hoax.groupby('Reporting District').agg({
+            'hoax_probability': 'mean',
+            'Incident Number': 'count'
+        }).rename(columns={'Incident Number': 'Number of Calls'})
+        
+        centrality_df = centrality_df.set_index('Reporting District').join(
+            district_info, how='left'
+        ).reset_index()
+        
+        centrality_df['Centrality Score'] = centrality_df['Centrality Score'].round(4)
+        centrality_df['hoax_probability'] = centrality_df['hoax_probability'].round(3)
+        
+        st.dataframe(centrality_df)
+        
+        # Visualize the top districts on a map
+        st.markdown("### Map of High Centrality Districts")
+        m_central = folium.Map(location=[33.954, -118.2], zoom_start=11, tiles="CartoDB positron")
+        
+        # Get unique districts from top centrality results
+        top_districts = [d for d, _ in sorted_centrality[:top_n]]
+        
+        # Plot points for top centrality districts
+        top_district_calls = suspicious_and_hoax[suspicious_and_hoax['Reporting District'].isin(top_districts)]
+        
+        for district in top_districts:
+            district_calls = top_district_calls[top_district_calls['Reporting District'] == district]
+            if len(district_calls) > 0:
+                # Use the first row for location
+                row = district_calls.iloc[0]
+                
+                # Get centrality value
+                centrality_val = next((v for d, v in sorted_centrality if d == district), 0)
+                
+                # Size based on centrality
+                size = 10 + (centrality_val * 50)
+                
+                folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=size,
+                    color='purple',
+                    fill=True,
+                    fill_opacity=0.7,
+                    popup=f"District: {district}<br>Centrality: {centrality_val:.4f}<br>Calls: {len(district_calls)}"
+                ).add_to(m_central)
+        
+        folium_static(m_central)
+        
+    except Exception as e:
+        st.error(f"Error in centrality calculation: {e}")
+        st.write("Error calculating network centrality measures. The network may be disconnected or have other structural issues.")
+else:
+    st.write("Not enough connected suspicious and hoax calls to calculate centrality measures.")
+
+# --- Final Summary Dashboard ---
+st.subheader("📈 Suspicious and Hoax Call Summary Dashboard")
+
+if len(suspicious_and_hoax) > 0:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top call types among suspicious/hoax calls
+        call_type_counts = suspicious_and_hoax['Call Type Description'].value_counts().head(5)
+        st.markdown("### Top Call Types (Suspicious/Hoax)")
+        
+        fig_types, ax_types = plt.subplots(figsize=(8, 5))
+        ax_types.bar(call_type_counts.index, call_type_counts.values, color='red')
+        ax_types.set_xticklabels(call_type_counts.index, rotation=45, ha='right')
+        ax_types.set_ylabel('Count')
+        plt.tight_layout()
+        st.pyplot(fig_types)
+    
+    with col2:
+        # Distribution of hoax probabilities  
+        st.markdown("### Hoax Probability Distribution")
+        
+        fig_prob, ax_prob = plt.subplots(figsize=(8, 5))
+        sns.histplot(suspicious_and_hoax['hoax_probability'], bins=20, kde=True, color='red', ax=ax_prob)
+        ax_prob.set_xlabel('Hoax Probability Score')
+        ax_prob.set_ylabel('Frequency')
+        plt.tight_layout()
+        st.pyplot(fig_prob)
+    
+    # Reporting districts with most suspicious/hoax calls
+    st.markdown("### Top Reporting Districts with Suspicious/Hoax Calls")
+    district_counts = suspicious_and_hoax['Reporting District'].value_counts().head(10)
+    
+    fig_districts, ax_districts = plt.subplots(figsize=(12, 6))
+    district_counts.plot(kind='bar', color='darkred', ax=ax_districts)
+    ax_districts.set_title('Top Districts with Suspicious/Hoax Calls')
+    ax_districts.set_xlabel('Reporting District')
+    ax_districts.set_ylabel('Number of Calls')
     plt.tight_layout()
-    st.pyplot(fig_hourly)
-
-# --- Correlation ---
-st.subheader("📌 Cross-Region Correlation")
-pivot = pd.crosstab(gdf['Reporting District'], gdf['Reporting District'])
-corr = pivot.T.corr()
-fig3, ax3 = plt.subplots(figsize=(12, 8))
-sns.heatmap(corr, cmap='coolwarm', ax=ax3)
-ax3.set_title("Cross-Region Correlation Based on Call Type Patterns")
-st.pyplot(fig3)
-
-# --- Graph ---
-st.subheader("📡 Distance-Based Relationship Graph")
-fig4, ax4 = plt.subplots(figsize=(12, 8))
-pos = nx.spring_layout(G)
-nx.draw(G, pos, with_labels=True, node_size=500, node_color='lightblue', edge_color='gray', ax=ax4)
-ax4.set_title("Distance-based Relationship Graph")
-st.pyplot(fig4)
-
-# --- Clustering --- #
-coords = gdf[['Latitude', 'Longitude']].values
-scaled_coords = StandardScaler().fit_transform(coords)
-
-kmeans = KMeans(n_clusters=3, random_state=42).fit(coords)
-dbscan = DBSCAN(eps=0.15, min_samples=5).fit(scaled_coords)
-spectral = SpectralClustering(n_clusters=3, assign_labels="discretize", random_state=42).fit(scaled_coords)
-
-gdf['Cluster_KMeans'] = kmeans.labels_
-gdf['Cluster_DBSCAN'] = dbscan.labels_
-gdf['Cluster_Spectral'] = spectral.labels_
-
-# --- Cluster Evaluation --- #
-st.subheader("📊 Clustering Evaluation")
-st.text("Silhouette Score:")
-st.text(f"KMeans: {silhouette_score(coords, gdf['Cluster_KMeans']):.3f}")
-st.text(f"DBSCAN: {silhouette_score(scaled_coords, gdf['Cluster_DBSCAN']) if len(set(gdf['Cluster_DBSCAN'])) > 1 else 'N/A'}")
-st.text(f"Spectral: {silhouette_score(scaled_coords, gdf['Cluster_Spectral']):.3f}")
-
-st.text("\nCalinski-Harabasz Index:")
-st.text(f"KMeans: {calinski_harabasz_score(coords, gdf['Cluster_KMeans']):.2f}")
-st.text(f"DBSCAN: {calinski_harabasz_score(scaled_coords, gdf['Cluster_DBSCAN']) if len(set(gdf['Cluster_DBSCAN'])) > 1 else 'N/A'}")
-st.text(f"Spectral: {calinski_harabasz_score(scaled_coords, gdf['Cluster_Spectral']):.2f}")
-
-st.text("\nDavies-Bouldin Index:")
-st.text(f"KMeans: {davies_bouldin_score(coords, gdf['Cluster_KMeans']):.3f}")
-st.text(f"DBSCAN: {davies_bouldin_score(scaled_coords, gdf['Cluster_DBSCAN']) if len(set(gdf['Cluster_DBSCAN'])) > 1 else 'N/A'}")
-st.text(f"Spectral: {davies_bouldin_score(scaled_coords, gdf['Cluster_Spectral']):.3f}")
-
-# --- Centrality Measures --- #
-st.subheader("🔗 Node Centrality Measures")
-
-# Compute centralities
-betweenness = nx.betweenness_centrality(G)
-closeness = nx.closeness_centrality(G)
-try:
-    eigenvector = nx.eigenvector_centrality(G, max_iter=1000)
-except nx.PowerIterationFailedConvergence:
-    eigenvector = {k: 0 for k in G.nodes()}
-
-centrality_options = {
-    'Betweenness Centrality': betweenness,
-    'Closeness Centrality': closeness,
-    'Eigenvector Centrality': eigenvector
-}
-
-selected_metric = st.selectbox("Select Centrality Metric", list(centrality_options.keys()))
-selected_dict = centrality_options[selected_metric]
-
-# Top N nodes
-sorted_centrality = sorted(selected_dict.items(), key=lambda item: item[1], reverse=True)
-top_n = st.slider("Number of top nodes to show", 5, 20, 10)
-
-st.markdown(f"### Top {top_n} Nodes by {selected_metric}")
-for node, val in sorted_centrality[:top_n]:
-    st.write(f"District {node}: {val:.4f}")
+    st.pyplot(fig_districts)
+    
+    # Table of suspicious/hoax calls by district with average probability
+    district_summary = suspicious_and_hoax.groupby('Reporting District').agg({
+        'Incident Number': 'count',
+        'hoax_probability': 'mean'
+    }).rename(columns={
+        'Incident Number': 'Number of Calls',
+        'hoax_probability': 'Average Hoax Probability'
+    }).sort_values('Number of Calls', ascending=False).head(20)
+    
+    district_summary['Average Hoax Probability'] = district_summary['Average Hoax Probability'].round(3)
+    
+    st.markdown("### Suspicious/Hoax Calls by District")
+    st.dataframe(district_summary)
+    
+else:
+    st.write("No suspicious or hoax calls identified with current parameters.")

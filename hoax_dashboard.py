@@ -33,7 +33,7 @@ else:
     st.stop()
 
 # Use only 0.1% of data for memory efficiency
-df = df.sample(frac=0.001, random_state=42).reset_index(drop=True)
+df = df.sample(frac=0.01, random_state=42).reset_index(drop=True)
 
 # Parse datetime
 df['Dispatch Date'] = pd.to_datetime(df['Dispatch Date'], errors='coerce')
